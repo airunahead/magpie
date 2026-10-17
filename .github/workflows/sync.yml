@@ -1,0 +1,30 @@
+name: Sync Upstream (yetone/magpie)
+
+permissions:
+  contents: write
+
+on:
+  schedule:
+    # 每天 UTC 时间 0:00（北京时间 8:00）自动执行一次
+    - cron: '0 0 * * *'
+  # 支持在 GitHub 网页界面手动点击执行测试
+  workflow_dispatch:
+
+jobs:
+  sync_latest_from_upstream:
+    name: Sync latest commits from upstream
+    runs-on: ubuntu-latest
+    if: ${{ github.repository != 'yetone/magpie' }} # 防止在上游原项目误跑
+
+    steps:
+      - name: Checkout target repo
+        uses: actions/checkout@v4
+
+      - name: Sync upstream changes
+        uses: aormsby/Fork-Sync-With-Upstream-action@v3.4.1
+        with:
+          upstream_sync_repo: yetone/magpie
+          upstream_sync_branch: main
+          target_sync_branch: main
+          target_repo_token: ${{ secrets.GITHUB_TOKEN }}
+          test_mode: false
