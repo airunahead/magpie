@@ -1,7 +1,8 @@
 package provider
 
 // Search APIs answer a model's web search when no provider can (#419):
-// Tavily, Brave Search, Exa, Firecrawl, You.com, a SearXNG of the user's. They are
+// Tavily, Brave Search, Exa, Firecrawl, You.com, DeepSeek, Volcengine's
+// Doubao Search, Tencent Cloud's Yuanbao Search, a SearXNG of the user's. They are
 // kept in providers.json beside the providers, their keys with theirs.
 
 import (
@@ -9,6 +10,8 @@ import (
 	"net/url"
 	"slices"
 	"strings"
+
+	"github.com/yetone/magpie/internal/plugin"
 )
 
 // SearchAPI is a web search API the user gave magpie a key to.
@@ -29,6 +32,12 @@ type SearchAPI struct {
 	// on again (#2286): to try one API alone, or rest one whose credit is
 	// nearly spent, without taking its key away.
 	Off bool `json:"off,omitempty"`
+	// Mix asks it together with the other search APIs marked so, at once,
+	// and gives the model their pages merged, a page two of them found
+	// once (#2845): no one API was best on every kind of question, and
+	// their pages together found more than any alone. With fewer than two
+	// such APIs that can be asked, a search goes in order as before.
+	Mix bool `json:"mix,omitempty"`
 }
 
 // How a search picks among a search API's keys (SearchAPI.Pick).
@@ -45,7 +54,25 @@ type SearchVendor struct {
 	// KeyOptional: it answers with no key too (a SearXNG; You.com's free
 	// search, YouFreeSearch)
 	KeyOptional bool
+	// Paths are what magpie puts after its base URL to search (the
+	// gateway's askSearchAPI): a base URL given ending in one of them is
+	// that base, so the path isn't asked twice (/search/search, #509)
+	Paths []string
+	// Plugin is the spec of the plugin that gives this API (its search
+	// hook), "" for one of magpie's own; PluginID is its id there. The
+	// plugin asks it (plugin.RunSearch); ID is plugin.PluginSearch.VendorID.
+	Plugin, PluginID string
+	// NeedURL: a plugin's API the user gives an address for, as a SearXNG
+	NeedURL bool
+	// Auth: a plugin's API that signs in as the same plugin's provider of
+	// this id (plugin.SearchDef.Auth), taking no key: each search is one
+	// of that provider's accounts that are on (SearchSignIn)
+	Auth string
 }
+
+// WantsURL is whether the user must give its address (a SearXNG's, or a
+// plugin's that asked for one).
+func (v SearchVendor) WantsURL() bool { return v.Base == "" && (v.Plugin == "" || v.NeedURL) }
 
 // YouFreeSearch is You.com's search that takes no key (#1626): 100
 // searches a day for each address, then 429. With a key, You.com is
@@ -54,22 +81,49 @@ const YouFreeSearch = "https://api.you.com/v1/agents/search"
 
 // SearchVendors are the search APIs magpie can ask, in the order offered.
 var SearchVendors = []SearchVendor{
-	{ID: "tavily", Name: "Tavily", Base: "https://api.tavily.com", KeysURL: "https://app.tavily.com/home"},
-	{ID: "brave", Name: "Brave Search", Base: "https://api.search.brave.com", KeysURL: "https://api-dashboard.search.brave.com/app/keys"},
-	{ID: "exa", Name: "Exa", Base: "https://api.exa.ai", KeysURL: "https://dashboard.exa.ai/api-keys"},
-	{ID: "firecrawl", Name: "Firecrawl", Base: "https://api.firecrawl.dev", KeysURL: "https://www.firecrawl.dev/app/api-keys"},
-	{ID: "you", Name: "You.com", Base: "https://ydc-index.io", KeysURL: "https://you.com/platform", KeyOptional: true},
-	{ID: "deepseek", Name: "DeepSeek", Base: "https://api.deepseek.com", KeysURL: "https://platform.deepseek.com/api_keys"},
-	{ID: "searxng", Name: "SearXNG", KeyOptional: true},
+	{ID: "tavily", Name: "Tavily", Base: "https://api.tavily.com", KeysURL: "https://app.tavily.com/home", Paths: []string{"/search"}},
+	{ID: "brave", Name: "Brave Search", Base: "https://api.search.brave.com", KeysURL: "https://api-dashboard.search.brave.com/app/keys", Paths: []string{"/res/v1/web/search"}},
+	{ID: "exa", Name: "Exa", Base: "https://api.exa.ai", KeysURL: "https://dashboard.exa.ai/api-keys", Paths: []string{"/search"}},
+	{ID: "firecrawl", Name: "Firecrawl", Base: "https://api.firecrawl.dev", KeysURL: "https://www.firecrawl.dev/app/api-keys", Paths: []string{"/v2/search"}},
+	{ID: "you", Name: "You.com", Base: "https://ydc-index.io", KeysURL: "https://you.com/platform", KeyOptional: true, Paths: []string{"/v1/search", "/v1/agents/search"}},
+	{ID: "deepseek", Name: "DeepSeek", Base: "https://api.deepseek.com", KeysURL: "https://platform.deepseek.com/api_keys", Paths: []string{"/v1/tools/search"}},
+	// Volcengine's Doubao Search Custom (豆包搜索 Custom版, once 联网搜索 /
+	// 融合信息搜索), with an API key from its console (CyberCaius on Discord)
+	{ID: "volcengine", Name: "Doubao Search (Volcengine)", Base: "https://open.feedcoopapi.com", KeysURL: "https://console.volcengine.com/search-infinity/api-key", Paths: []string{"/search_api/web_search"}},
+	// Tencent Cloud's Yuanbao Search (元宝搜索, wsa) by its service API
+	// key (服务 API KEY 方式, cloud.tencent.com/document/product/1806/130615),
+	// made in its console's 概览 › 服务 API KEY 方式 (plugins#509)
+	{ID: "wsa", Name: "Yuanbao Search (Tencent Cloud)", Base: "https://api.wsa.cloud.tencent.com", KeysURL: "https://console.cloud.tencent.com/wsapi/index", Paths: []string{"/SearchPro"}},
+	{ID: "searxng", Name: "SearXNG", KeyOptional: true, Paths: []string{"/search"}},
 }
 
-// SearchVendorOf is the vendor by its id.
+// AllSearchVendors are SearchVendors and the search APIs the plugins that
+// are on give (their search hook), after them. A plugin note that can't be
+// read adds none.
+func AllSearchVendors() []SearchVendor {
+	out := slices.Clone(SearchVendors)
+	ps, _ := plugin.NotedSearches()
+	for _, p := range ps {
+		out = append(out, SearchVendor{ID: p.VendorID(), Name: p.Name, KeysURL: p.KeysURL, KeyOptional: p.KeyOptional,
+			Plugin: p.Spec, PluginID: p.ID, NeedURL: p.NeedURL, Auth: p.Auth})
+	}
+	return out
+}
+
+// SearchVendorOf is the vendor by its id: one of magpie's, or a plugin's.
 func SearchVendorOf(id string) (SearchVendor, bool) {
 	i := slices.IndexFunc(SearchVendors, func(v SearchVendor) bool { return v.ID == id })
-	if i < 0 {
+	if i >= 0 {
+		return SearchVendors[i], true
+	}
+	if !strings.Contains(id, ":") {
 		return SearchVendor{}, false
 	}
-	return SearchVendors[i], true
+	all := AllSearchVendors()
+	if i := slices.IndexFunc(all[len(SearchVendors):], func(v SearchVendor) bool { return v.ID == id }); i >= 0 {
+		return all[len(SearchVendors)+i], true
+	}
+	return SearchVendor{}, false
 }
 
 // Keys are the keys in Key: one, or several the user gave separated by
@@ -112,20 +166,37 @@ func (a SearchAPI) Name() string {
 	return a.Vendor
 }
 
-// Base is the address it is asked at, without a slash at its end.
+// Base is the address it is asked at, without a slash at its end, nor
+// the vendor's own path (SearchVendor.Paths) when its URL was given with
+// it: one saved so before is asked right too (#509).
 func (a SearchAPI) Base() string {
 	if a.URL != "" {
-		return strings.TrimRight(a.URL, "/")
+		return a.ownBase()
 	}
 	v, _ := SearchVendorOf(a.Vendor)
 	return v.Base
 }
 
+// ownBase is URL without a slash at its end, nor the vendor's path at
+// its end (…/search for Tavily): magpie puts that path after it.
+func (a SearchAPI) ownBase() string {
+	u := strings.TrimRight(a.URL, "/")
+	v, _ := SearchVendorOf(a.Vendor)
+	for _, p := range v.Paths {
+		if len(u) > len(p) && strings.EqualFold(u[len(u)-len(p):], p) {
+			return strings.TrimRight(u[:len(u)-len(p)], "/")
+		}
+	}
+	return u
+}
+
 // Ready is whether it can be asked: a vendor magpie knows, at an address,
-// with a key where it needs one (a SearXNG, You.com, may not).
+// with a key where it needs one (a SearXNG, You.com, may not; one that
+// signs in never does: signed out, a search says so and the next API is
+// asked).
 func (a SearchAPI) Ready() bool {
 	v, known := SearchVendorOf(a.Vendor)
-	return known && a.Base() != "" && (a.Key != "" || v.KeyOptional)
+	return known && (a.Base() != "" || (v.Plugin != "" && !v.NeedURL)) && (a.Key != "" || v.KeyOptional || v.Auth != "")
 }
 
 // check says what is wrong with a search API the user gives.
@@ -133,7 +204,7 @@ func (a SearchAPI) check() error {
 	v, ok := SearchVendorOf(a.Vendor)
 	if !ok {
 		var ids []string
-		for _, v := range SearchVendors {
+		for _, v := range AllSearchVendors() {
 			ids = append(ids, v.ID)
 		}
 		return fmt.Errorf("no search API %q: one of %s", a.Vendor, strings.Join(ids, ", "))
@@ -155,7 +226,10 @@ func (a SearchAPI) check() error {
 	if a.Vendor == "searxng" && a.URL == "" {
 		return fmt.Errorf("SearXNG needs its address, as url=https://…")
 	}
-	if a.Key == "" && !v.KeyOptional {
+	if v.Plugin != "" && v.NeedURL && a.URL == "" {
+		return fmt.Errorf("%s needs its address, as url=https://…", a.Name())
+	}
+	if a.Key == "" && !v.KeyOptional && v.Auth == "" {
 		return fmt.Errorf("%s needs its API key", a.Name())
 	}
 	return nil
@@ -189,7 +263,7 @@ func StoredSearchAPIs() []SearchAPI { return load().Searches }
 // SetSearchAPI adds a search API, last, or changes the one of its vendor
 // where it is; a change with no key keeps the key it has, and one with no
 // Pick the pick it has ("turns" puts the default back). One switched off
-// stays off.
+// stays off, and one marked mix stays mixed.
 func SetSearchAPI(a SearchAPI) error {
 	a.Vendor = strings.ToLower(strings.TrimSpace(a.Vendor))
 	a.Key, a.URL = strings.Join(a.Keys(), ","), strings.TrimSpace(a.URL)
@@ -203,7 +277,7 @@ func SetSearchAPI(a SearchAPI) error {
 		a.Key = f.Searches[i].Key
 	}
 	if i >= 0 {
-		a.Off = f.Searches[i].Off
+		a.Off, a.Mix = f.Searches[i].Off, f.Searches[i].Mix
 	}
 	switch {
 	case pick == "turns":
@@ -215,6 +289,10 @@ func SetSearchAPI(a SearchAPI) error {
 	}
 	if err := a.check(); err != nil {
 		return err
+	}
+	if a.URL != "" {
+		// kept as its base, the field showing what is asked
+		a.URL = a.ownBase()
 	}
 	if i >= 0 {
 		f.Searches[i] = a
@@ -253,6 +331,31 @@ func SwitchSearchAPI(vendor string, on bool) error {
 		return nil
 	}
 	f.Searches[i].Off = !on
+	return store(f)
+}
+
+// MixSearchAPIs marks the vendors' search APIs to be asked together
+// (SearchAPI.Mix, #2845), and every other one not: two or more, each set
+// up and named once. None puts every one back to being asked in order.
+func MixSearchAPIs(vendors []string) error {
+	if len(vendors) == 1 {
+		return fmt.Errorf("name two or more search APIs to ask together")
+	}
+	f, err := read()
+	if err != nil {
+		return err
+	}
+	for i, v := range vendors {
+		if !slices.ContainsFunc(f.Searches, func(x SearchAPI) bool { return x.Vendor == v }) {
+			return fmt.Errorf("no %s search API is set up", v)
+		}
+		if slices.Contains(vendors[:i], v) {
+			return fmt.Errorf("%s is named twice", v)
+		}
+	}
+	for i := range f.Searches {
+		f.Searches[i].Mix = slices.Contains(vendors, f.Searches[i].Vendor)
+	}
 	return store(f)
 }
 
