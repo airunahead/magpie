@@ -3,8 +3,11 @@
 // vendor's page says is left, and magpie counts down from it by what its
 // own usage prices the calls it sends on the key (provider/
 // key_balance_own.go). Typing it again sets it anew. It may be typed in
-// yuan ("¥100", or a bare number while Settings shows costs in CNY), and
-// may refill each month or week. keyspend.js imports this when the
+// yuan ("¥100", or picked beside the field, which starts at the balance's
+// own currency, else Settings' one), and may refill each month or week.
+// Part of it may expire on a day (credit good until a date): the pill
+// says how much and in how many days, amber from a week, and the rest of
+// the balance is what stays after it. keyspend.js imports this when the
 // provider editor draws a key's row, so it weighs nothing on the core.
 const moneyText = (v, cny) => (v < 0 ? "-" : "") + (cny ? "¥" : "$") + Math.abs(v).toFixed(2);
 // balanceAmount reads what was typed: an amount and whether it is in
@@ -18,12 +21,29 @@ function balanceAmount(s, unit) {
   const n = Number(a);
   return a && n >= 0 && n <= 1e6 ? { n, cny } : null;
 }
+// dayOf: a day as the date it is here, 2026-12-31; dateText: one shown
+const dayOf = (d) => [d.getFullYear(), d.getMonth() + 1, d.getDate()].map((n) => String(n).padStart(2, "0")).join("-");
+const dateText = (s) => new Date(s + "T00:00").toLocaleDateString(intlLang(), { dateStyle: "medium" });
+// lastDay reads the last day credit counts: 2026-12-31 (or with / or .),
+// from today on; null else
+function lastDay(s) {
+  const m = s.trim().match(/^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})$/);
+  if (!m) return null;
+  const d = new Date(+m[1], m[2] - 1, +m[3]);
+  return d.getMonth() === m[2] - 1 && d.getDate() === +m[3] && dayOf(d) >= dayOf(new Date()) ? dayOf(d) : null;
+}
 const weekdayName = (d) => new Date(2026, 10, 1 + d).toLocaleDateString(intlLang(), { weekday: "long" }); // 2026-11-02 is a Monday
 function keyBalancePill(p, k) {
   const b = k.balance, name = k.name || k.masked, cny = b?.currency === "cny";
   const pill = el("button", "abal" + (b ? " set" : ""));
   pill.type = "button";
   pill.textContent = b ? t("≈{usd} left", { usd: b.left == null ? (cny ? "¥" : "$") + "…" : moneyText(b.left, cny) }) : t("Set balance");
+  const x = b?.expiring, xin = x && expiresIn(x.ends), xlast = x && dayOf(new Date(new Date(x.ends) - 1));
+  if (x?.left > 0) {
+    const amount = moneyText(x.left, cny);
+    pill.append(" · ", el("span", "abal-exp" + (xin.soon ? " soon" : ""), xin.days <= 0 ? t("{amount} expires today", { amount })
+      : xin.days === 1 ? t("{amount} expires tomorrow", { amount }) : t("{amount} expires in {n} days", { amount, n: xin.days })));
+  }
   pill.title = !b ? t("Type what the vendor's page says this key has left, and magpie counts down from it as it sends requests")
     : [t("An estimate: {set} from {when}, less {spent} magpie counted spent on this key since, at the prices the Usage page shows. Click to change", {
         set: moneyText(b.set, cny), when: new Date(b.from || b.at).toLocaleString(intlLang()),
@@ -31,6 +51,9 @@ function keyBalancePill(p, k) {
       }),
       b.left == null ? t("The dollar's rate in yuan isn't known yet, so what is left can't be counted") : "",
       b.refill && b.next ? t("Refills to {set} on {when}", { set: moneyText(b.set, cny), when: new Date(b.next).toLocaleString(intlLang(), { dateStyle: "medium" }) }) : "",
+      x ? t("Of it, {left} of the {set} typed {when} is spent first and counts through {last}", { left: x.left == null ? "…" : moneyText(x.left, cny), set: moneyText(x.set, cny),
+        when: new Date(x.at).toLocaleString(intlLang()), last: dateText(xlast) }) : "",
+      b.expired ? t("The credit that expired on {last} no longer counts", { last: dateText(dayOf(new Date(new Date(b.expired) - 1))) }) : "",
     ].filter(Boolean).join("\n");
   const set = (v) => accountAction("provider/keyownbalance", { id: p.id, account: k.id, balance: v ? v.n : null, ...v?.cny && { currency: "cny" } },
     !v ? t("{who} has no balance typed", { who: name }) : t("{who} has {usd} left", { who: name, usd: moneyText(v.n, v.cny) }));
@@ -38,11 +61,66 @@ function keyBalancePill(p, k) {
     !r ? t("{who} no longer refills", { who: name })
       : r.every === "week" ? t("{who} refills each {weekday}", { who: name, weekday: weekdayName(r.day) })
       : t("{who} refills on day {day} of each month", { who: name, day: r.day }));
-  // a bare number is in the balance's own currency, else in Settings' one
-  const unit = b ? (cny ? "cny" : "usd") : currency === "cny" ? "cny" : "usd";
-  const type = () => pillNumber(pill, b ? (cny ? "¥" : "") + b.set : "", unit === "cny" ? "CNY" : "USD", "abal-in",
-    t(unit === "cny" ? "Balance, in CNY" : "Balance, in USD"), (s) => balanceAmount(s, unit),
-    t("A balance is an amount from 0 to 1,000,000, in USD or in yuan (¥)"), null, set);
+  const expiring = (v) => accountAction("provider/keyexpiring", { id: p.id, account: k.id, expiring: v },
+    !v ? t("{who} has no credit that expires", { who: name }) : t("{who} has {amount} that counts through {last}", { who: name, amount: moneyText(v.amount, cny), last: dateText(v.until) }));
+  // credit that expires: its amount, in the balance's currency, then the
+  // last day it counts, each typed where the pill was
+  const credit = () => {
+    const at = pill.parentNode, own = cny ? "cny" : "usd";
+    pillNumber(pill, x ? String(x.set) : "", cny ? "¥" : "$", "abal-in", t(cny ? "Credit that expires, in CNY" : "Credit that expires, in USD"),
+      (s) => { const v = balanceAmount(s, own); return v && v.n > 0 && v.cny === cny ? v.n : null; },
+      t("Credit that expires is an amount above 0, in the balance's currency"), null, (amount) => {
+        const i = at?.querySelector(":scope > .abal-in");
+        if (!i) return;
+        pillNumber(i, xlast || "", "2026-12-31", "abal-in abal-day", t("Last day it counts"), lastDay,
+          t("The last day is a date from today on, as 2026-12-31"), null, (until) => expiring({ amount, until }));
+        at.querySelector(":scope > .abal-day").inputMode = "text";
+      });
+  };
+  // a bare number is in the currency the button beside the field shows:
+  // the balance's own, else Settings' one, until the user picks the other
+  // there (tenacious_eagle: no clearing it and going to Settings). Picking
+  // keeps the number typed, so 100 becomes ¥100 only by that pick.
+  let unit = b ? (cny ? "cny" : "usd") : currency === "cny" ? "cny" : "usd";
+  const type = () => {
+    const at = pill.parentNode;
+    pillNumber(pill, b ? String(b.set) : "", "", "abal-in", "", (s) => balanceAmount(s, unit),
+      t("A balance is an amount from 0 to 1,000,000, in USD or in yuan (¥)"), null, set);
+    const i = at?.querySelector(":scope > .abal-in");
+    if (!i) return;
+    const cur = el("button", "abal-cur"), save = i.onblur;
+    cur.type = "button";
+    cur.setAttribute("aria-haspopup", "menu");
+    cur.setAttribute("aria-expanded", "false");
+    let picking = false;
+    // a sign typed in the field says its currency, and the button follows
+    const now = () => (balanceAmount(i.value, unit)?.cny ?? unit === "cny") ? "cny" : "usd";
+    const show = () => {
+      const c = now();
+      cur.replaceChildren(c.toUpperCase(), svg(CHEV, 12, 1.6));
+      cur.setAttribute("aria-label", t("Currency"));
+      i.setAttribute("aria-label", t(c === "cny" ? "Balance, in CNY" : "Balance, in USD"));
+    };
+    i.oninput = show;
+    // the field saves as it is left, but not for its currency's menu
+    i.onblur = (e) => { if (!picking && e.relatedTarget !== cur) save(); };
+    cur.onblur = (e) => { if (!picking && e.relatedTarget !== i) save(); };
+    cur.onmousedown = (e) => e.preventDefault();
+    cur.onkeydown = (e) => e.stopPropagation();
+    cur.onclick = (e) => {
+      e.stopPropagation();
+      if (cur.classList.contains("open")) return closeProtoMenu();
+      picking = true;
+      openProtoMenu(cur, CURRENCIES.map(([v, name]) => ({ v, name, literalName: true, note: "" })), now(), (v) => {
+        unit = v;
+        i.value = i.value.trim().replace(/^(\$|¥|￥|cny|rmb|usd)\s*|\s*(元|cny|rmb|yuan|usd)$/gi, "");
+        show();
+      }, "Currency", "sess-menu");
+      protoMenu.done = () => { picking = false; i.focus(NO_SCROLL); };
+    };
+    show();
+    i.after(cur);
+  };
   const day = (s) => { const n = Number(s.trim()); return Number.isInteger(n) && n >= 1 && n <= 31 ? n : null; };
   const monthly = () => pillNumber(pill, String(b.refill?.every === "month" ? b.refill.day : 1), "1–31", "abal-in", t("Refill day of the month"), day,
     t("A day of the month is a whole number from 1 to 31"), b.refill?.every === "month" ? b.refill.day : null, (d) => refill({ every: "month", day: d }));
@@ -54,11 +132,13 @@ function keyBalancePill(p, k) {
     if (pill.classList.contains("open")) return closeProtoMenu();
     openProtoMenu(pill, [
       { v: "set", name: "Enter balance…", note: "Counts down from now" },
+      { v: "exp", name: "Credit that expires…", note: "" },
+      ...x || b.expired ? [{ v: "noexp", name: "No credit that expires", note: "" }] : [],
       { v: "month", name: "Refills each month…", note: "" },
       { v: "week", name: "Refills each week…", note: "" },
       { v: "never", name: "Never refills", note: "" },
       { v: "off", name: "No balance", note: "" },
-    ], b.refill?.every || "never", (v) => v === "off" ? set(null) : v === "month" ? monthly() : v === "week" ? weekly()
+    ], b.refill?.every || "never", (v) => v === "off" ? set(null) : v === "exp" ? credit() : v === "noexp" ? expiring(null) : v === "month" ? monthly() : v === "week" ? weekly()
       : v === "never" ? b.refill && refill(null) : type(), "Balance", "sess-menu");
   };
   return pill;
